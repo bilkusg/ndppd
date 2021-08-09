@@ -13,6 +13,16 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
+// Modified by Gary Bilkus to work when listening on non-ethernet tunnels
+// The original code assumed that all packets received on the pfd interface would have an ethernet header
+// first, and therefore filters and parsing skipped the first 14 bytes
+// However tunnels such as tun and wg used by vpns don't have any such header and that meant that 
+// ndppd won't work using them
+// The cleanest solution is to change the SOCK_RAW parameter for SOCK_DGRAM when opening the pfd socket. That
+// automatically removes any ethernet header if there is one. We then modify the parsers not to expect a 
+// header and everything seems to work.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -101,7 +111,7 @@ ptr<iface> iface::open_pfd(const std::string& name, bool promiscuous)
 
     // Create a socket.
 
-    if ((fd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_IPV6))) < 0) {
+    if ((fd = socket(PF_PACKET, SOCK_DGRAM, htons(ETH_P_IPV6))) < 0) {
         logger::error() << "Unable to create socket";
         return ptr<iface>();
     }
@@ -139,19 +149,9 @@ ptr<iface> iface::open_pfd(const std::string& name, bool promiscuous)
     // Set up filter.
 
     static struct sock_filter filter[] = {
-        // Load the ether_type.
-        BPF_STMT(BPF_LD | BPF_H | BPF_ABS,
-            offsetof(struct ether_header, ether_type)),
-        // Bail if it's* not* ETHERTYPE_IPV6.
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, ETHERTYPE_IPV6, 0, 5),
-        // Load the next header type.
-        BPF_STMT(BPF_LD | BPF_B | BPF_ABS,
-            sizeof(struct ether_header) + offsetof(struct ip6_hdr, ip6_nxt)),
-        // Bail if it's* not* IPPROTO_ICMPV6.
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IPPROTO_ICMPV6, 0, 3),
         // Load the ICMPv6 type.
         BPF_STMT(BPF_LD | BPF_B | BPF_ABS,
-            sizeof(struct ether_header) + sizeof(ip6_hdr) + offsetof(struct icmp6_hdr, icmp6_type)),
+            sizeof(ip6_hdr) + offsetof(struct icmp6_hdr, icmp6_type)),
         // Bail if it's* not* ND_NEIGHBOR_SOLICIT.
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, ND_NEIGHBOR_SOLICIT, 0, 1),
         // Keep packet.
@@ -161,7 +161,7 @@ ptr<iface> iface::open_pfd(const std::string& name, bool promiscuous)
     };
 
     static struct sock_fprog fprog = {
-        8,
+        4,
         filter
     };
 
@@ -379,10 +379,10 @@ ssize_t iface::read_solicit(address& saddr, address& daddr, address& taddr)
     }
 
     struct ip6_hdr* ip6h =
-          (struct ip6_hdr* )(msg + ETH_HLEN);
+          (struct ip6_hdr* )(msg );
 
     struct nd_neighbor_solicit*  ns =
-        (struct nd_neighbor_solicit*)(msg + ETH_HLEN + sizeof(struct ip6_hdr));
+        (struct nd_neighbor_solicit*)(msg + sizeof(struct ip6_hdr));
 
     taddr = ns->nd_ns_target;
     daddr = ip6h->ip6_dst;
